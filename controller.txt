@@ -1,0 +1,292 @@
+/*
+ * ESP32 #2 - Central Controller
+ * Scans channels, computes interference scores, decides channel switches,
+ * hosts web dashboard, and runs UDP echo server for IoT node metrics.
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiUDP.h>
+#include <HTTPClient.h>
+
+// Wi-Fi credentials
+const char* ssid = "DynamicAP";
+const char* password = "password";
+
+// Static IP for controller
+IPAddress local_IP(192,168,4,2);
+IPAddress gateway(192,168,4,1);
+IPAddress subnet(255,255,255,0);
+
+// Web server on port 80
+WebServer server(80);
+
+// UDP server for IoT node echo
+WiFiUDP udp;
+const int udpPort = 8888;
+
+// AP control endpoint
+String apURL = "http://192.168.4.1";
+// At the top with other global variables
+float avgRssiPerChannel[13] = {0};  // average RSSI for each channel (index 0 = channel 1)
+// -------------------------------------------------------------------
+// Data structures
+struct ChannelInfo {
+  int channel;
+  int apCount;
+  int strongCount;
+  float interferenceScore;
+};
+
+ChannelInfo channels[13];       // index 0 = channel 1, ... index 12 = channel 13
+int currentChannel = 1;         // last known AP channel
+
+// Metrics from IoT node
+float avgLatency = 0.0;
+float packetLoss = 0.0;
+
+// Timing
+unsigned long lastScan = 0;
+const int scanInterval = 30000; // 30 seconds
+
+// -------------------------------------------------------------------
+// Scan all channels and fill channel info
+void scanChannels() {
+  // Reset counts and RSSI accumulators
+  for (int i = 0; i < 13; i++) {
+    channels[i].channel = i + 1;
+    channels[i].apCount = 0;
+    channels[i].strongCount = 0;
+    avgRssiPerChannel[i] = 0;
+  }
+
+  int n = WiFi.scanNetworks(false, true);
+  // Temporary sum and count for averaging
+  float rssiSum[13] = {0};
+  int apCount[13] = {0};
+
+  for (int i = 0; i < n; i++) {
+    int ch = WiFi.channel(i);
+    int rssi = WiFi.RSSI(i);
+    if (ch >= 1 && ch <= 13) {
+      channels[ch - 1].apCount++;
+      if (rssi > -70) channels[ch - 1].strongCount++;
+      rssiSum[ch - 1] += rssi;
+      apCount[ch - 1]++;
+    }
+  }
+
+  // Compute averages
+  for (int i = 0; i < 13; i++) {
+    if (apCount[i] > 0) {
+      avgRssiPerChannel[i] = rssiSum[i] / apCount[i];
+    } else {
+      avgRssiPerChannel[i] = -100;  // default low value (no APs)
+    }
+  }
+
+  WiFi.scanDelete();
+}
+// -------------------------------------------------------------------
+// Compute interference scores
+void computeScores() {
+  for (int i = 0; i < 13; i++) {
+    float score = 0.0;
+    int ch = i + 1;
+
+    // Base contribution
+    score += channels[i].apCount * 1.0;
+    score += channels[i].strongCount * 2.0;
+
+    // Adjacent channel interference (channels ±2)
+    for (int adj = -2; adj <= 2; adj++) {
+      if (adj == 0) continue;
+      int adjCh = ch + adj;
+      if (adjCh >= 1 && adjCh <= 13) {
+        float weight = (abs(adj) == 1) ? 0.5 : 0.25;
+        score += channels[adjCh - 1].apCount * weight;
+        score += channels[adjCh - 1].strongCount * weight * 2.0;
+      }
+    }
+
+    // Preference for non-overlapping channels (1,6,11)
+    if (ch == 1 || ch == 6 || ch == 11) {
+      score *= 0.8;     // 20% reduction
+    }
+
+    channels[i].interferenceScore = score;
+  }
+}
+
+// -------------------------------------------------------------------
+// Return channel with lowest score
+int getBestChannel() {
+  int best = 1;
+  float bestScore = channels[0].interferenceScore;
+  for (int i = 1; i < 11; i++) {   // Only channels 1-11 (indices 0-10)
+    if (channels[i].interferenceScore < bestScore) {
+      bestScore = channels[i].interferenceScore;
+      best = i + 1;
+    }
+  }
+  return best;
+}
+// -------------------------------------------------------------------
+// Send HTTP command to AP to change channel
+bool setAPChannel(int channel) {
+  HTTPClient http;
+  String url = apURL + "/setchannel?channel=" + String(channel);
+  http.begin(url);
+  int httpCode = http.GET();
+  if (httpCode > 0) {
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      http.end();
+      if (payload.indexOf("OK") >= 0) {
+        currentChannel = channel;
+        Serial.print("Switched to channel ");
+        Serial.println(channel);
+        return true;
+      }
+    }
+  }
+  http.end();
+  return false;
+}
+
+// -------------------------------------------------------------------
+// UDP echo handler
+void handleUDP() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    char buffer[255];
+    int len = udp.read(buffer, 255);
+    if (len > 0) {
+      buffer[len] = 0;
+      // Echo back exactly what we received
+      udp.beginPacket(udp.remoteIP(), udp.remotePort());
+      udp.write((const uint8_t*)buffer, strlen(buffer));
+      udp.endPacket();
+    }
+  }
+}
+
+// -------------------------------------------------------------------
+// Web server handlers
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><title>Dynamic Channel Dashboard</title>";
+  html += "<meta http-equiv='refresh' content='5'/>";
+  html += "<style>body{font-family:Arial;}</style></head><body>";
+  html += "<h1>Dynamic Channel Allocation</h1>";
+  html += "<p>Current Channel: <strong>" + String(currentChannel) + "</strong></p>";
+  html += "<p>Avg Latency: " + String(avgLatency) + " ms</p>";
+  html += "<p>Packet Loss: " + String(packetLoss) + " %</p>";
+  html += "<h2>Channel Scores</h2><ul>";
+  for (int i = 0; i < 13; i++) {
+    html += "<li>Channel " + String(i+1) + ": Score " + String(channels[i].interferenceScore) +
+            " (APs: " + String(channels[i].apCount) + ", Strong: " + String(channels[i].strongCount) + ")</li>";
+  }
+  html += "</ul></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleAPIStatus() {
+  String json = "{";
+  json += "\"currentChannel\":" + String(currentChannel) + ",";
+  json += "\"avgLatency\":" + String(avgLatency) + ",";
+  json += "\"packetLoss\":" + String(packetLoss) + ",";
+  json += "\"channels\":[";
+  for (int i = 0; i < 13; i++) {
+    json += "{\"channel\":" + String(i+1) + 
+            ",\"score\":" + String(channels[i].interferenceScore) +
+            ",\"apCount\":" + String(channels[i].apCount) +
+            ",\"strongCount\":" + String(channels[i].strongCount) +
+            ",\"avgRssi\":" + String(avgRssiPerChannel[i]) + "}";
+    if (i < 12) json += ",";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleNodeMetrics() {
+  if (server.hasArg("latency") && server.hasArg("loss")) {
+    avgLatency = server.arg("latency").toFloat();
+    packetLoss = server.arg("loss").toFloat();
+    server.send(200, "text/plain", "OK");
+    Serial.print("Metrics received: latency=");
+    Serial.print(avgLatency);
+    Serial.print(" ms, loss=");
+    Serial.println(packetLoss);
+  } else {
+    server.send(400, "text/plain", "Missing params");
+  }
+}
+void handleSwitch() {
+  if (server.hasArg("channel")) {
+    int ch = server.arg("channel").toInt();
+    if (ch >= 1 && ch <= 13) {
+      if (setAPChannel(ch)) {
+        server.send(200, "text/plain", "Switched to channel " + String(ch));
+      } else {
+        server.send(500, "text/plain", "Failed to switch");
+      }
+    } else {
+      server.send(400, "text/plain", "Invalid channel");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing channel");
+  }
+}
+
+// -------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+
+  // Connect to AP with static IP
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("Static IP config failed");
+  }
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nController connected. IP: " + WiFi.localIP().toString());
+
+  // Start web server
+  server.on("/", handleRoot);
+  server.on("/api/status", handleAPIStatus);
+  server.on("/api/node-metrics", HTTP_GET, handleNodeMetrics);
+  server.on("/api/node-metrics", HTTP_POST, handleNodeMetrics);
+  server.on("/api/switch", handleSwitch);
+  server.begin();
+
+  // Start UDP
+  udp.begin(udpPort);
+
+  // Initial scan
+  scanChannels();
+  computeScores();
+  lastScan = millis();
+}
+
+// -------------------------------------------------------------------
+void loop() {
+  server.handleClient();
+  handleUDP();
+
+  if (millis() - lastScan > scanInterval) {
+    lastScan = millis();
+    scanChannels();
+    computeScores();
+
+    int best = getBestChannel();
+    float currentScore = channels[currentChannel - 1].interferenceScore;
+    float bestScore = channels[best - 1].interferenceScore;
+
+    // Switch if best channel is at least 20% better
+    if (bestScore < currentScore * 0.8) {
+      setAPChannel(best);
+    }
+  }
+}

@@ -1,0 +1,116 @@
+/*
+ * ESP32 #3 - IoT Node
+ * Sends UDP packets to controller to measure latency and packet loss.
+ * Reports aggregated metrics via HTTP every 10 seconds.
+ */
+
+#include <WiFi.h>
+#include <WiFiUDP.h>
+#include <HTTPClient.h>
+
+const char* ssid = "DynamicAP";
+const char* password = "password";
+
+// Static IP for IoT node
+IPAddress local_IP(192,168,4,3);
+IPAddress gateway(192,168,4,1);
+IPAddress subnet(255,255,255,0);
+
+// Controller IP (UDP and HTTP)
+IPAddress controllerIP(192,168,4,2);
+const int udpPort = 8888;
+
+WiFiUDP udp;
+
+unsigned long lastSend = 0;
+const int sendInterval = 1000;      // send UDP packet every 1 second
+int sequence = 0;
+unsigned long sendTime;
+
+// Metrics accumulators
+int packetsSent = 0;
+int packetsAcked = 0;
+unsigned long totalRTT = 0;
+int rttCount = 0;
+
+unsigned long lastReport = 0;
+const int reportInterval = 10000;   // report every 10 seconds
+
+// -------------------------------------------------------------------
+void sendUDP() {
+  String msg = "SEQ=" + String(sequence) + ",TS=" + String(millis());
+  udp.beginPacket(controllerIP, udpPort);
+  udp.write((const uint8_t*)msg.c_str(), msg.length());
+  udp.endPacket();
+  sendTime = millis();
+  packetsSent++;
+}
+
+// -------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("Static IP config failed");
+  }
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nIoT node connected. IP: " + WiFi.localIP().toString());
+
+  udp.begin(udpPort);   // listen for echoes
+}
+
+// -------------------------------------------------------------------
+void loop() {
+  // Check for incoming UDP echo
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    char buffer[255];
+    int len = udp.read(buffer, 255);
+    if (len > 0) {
+      buffer[len] = 0;
+      // Assume echo corresponds to last sent packet (simplified)
+      unsigned long now = millis();
+      unsigned long rtt = now - sendTime;
+      totalRTT += rtt;
+      rttCount++;
+      packetsAcked++;
+      sequence++;   // next sequence number
+    }
+  }
+
+  // Send new UDP packet
+  if (millis() - lastSend > sendInterval) {
+    lastSend = millis();
+    sendUDP();
+  }
+
+  // Report metrics to controller
+  if (millis() - lastReport > reportInterval) {
+    lastReport = millis();
+
+    float avgLatency = (rttCount > 0) ? (float)totalRTT / rttCount : 0;
+    float loss = (packetsSent > 0) ? (1.0 - (float)packetsAcked / packetsSent) * 100 : 0;
+
+    HTTPClient http;
+    String url = "http://192.168.4.2/api/node-metrics?latency=" + String(avgLatency) + "&loss=" + String(loss);
+    http.begin(url);
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println("Metrics reported");
+    } else {
+      Serial.print("Report failed, code: ");
+      Serial.println(httpCode);
+    }
+    http.end();
+
+    // Reset accumulators
+    packetsSent = 0;
+    packetsAcked = 0;
+    totalRTT = 0;
+    rttCount = 0;
+  }
+}
